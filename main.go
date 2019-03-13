@@ -27,7 +27,10 @@ import (
 	"bazil.org/fuse/fs"
 	"github.com/golang/glog"
 	"github.com/maisem/kubefs/pkg/kubefs"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/discovery"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/rest"
 	controllers "sigs.k8s.io/controller-runtime"
 )
 
@@ -44,44 +47,92 @@ func handleInterrupt(f func() error) {
 
 var (
 	mountPath = flag.String("path", "fuse", "the mount path for kubefs")
-	types     = []struct {
-		apiVersion string
-		kind       string
-	}{
-		{
-			apiVersion: "apps/v1",
-			kind:       "Deployment",
-		},
-		{
-			apiVersion: "v1",
-			kind:       "Pod",
-		},
-		{
-			apiVersion: "v1",
-			kind:       "Service",
-		},
-		{
-			apiVersion: "apps/v1",
-			kind:       "ReplicaSet",
-		},
-	}
 )
+
+type apiResource struct {
+	kind       string
+	apiVersion string
+}
+
+func isWatchable(r *metav1.APIResource) bool {
+	var (
+		listable  bool
+		watchable bool
+		gettable  bool
+	)
+
+	for _, v := range r.Verbs {
+		switch v {
+		case "get":
+			gettable = true
+		case "watch":
+			watchable = true
+		case "list":
+			listable = true
+		}
+	}
+	return listable && watchable && gettable
+}
+
+func getAllResources(cfg *rest.Config) []*apiResource {
+	dc := discovery.NewDiscoveryClientForConfigOrDie(cfg)
+	gl, err := dc.ServerGroups()
+	if err != nil {
+		glog.Fatalf("could not get list of groups: %v", err)
+	}
+
+	var resources []*apiResource
+	for _, g := range gl.Groups {
+		var gv string
+		if g.PreferredVersion.GroupVersion != "" {
+			gv = g.PreferredVersion.GroupVersion
+		} else if len(g.Versions) > 0 {
+			// Just pick the first.
+			gv = g.Versions[0].GroupVersion
+		} else {
+			continue
+		}
+		resources = append(resources, getResourcesForGroup(dc, gv)...)
+	}
+	return resources
+}
+
+func getResourcesForGroup(dc discovery.DiscoveryInterface, groupVersion string) []*apiResource {
+	rl, err := dc.ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		glog.Fatalf("could not get list of resources for %v: %v", groupVersion, err)
+	}
+	var resources []*apiResource
+	for _, r := range rl.APIResources {
+		if !isWatchable(&r) {
+			continue
+		}
+		resources = append(resources, &apiResource{
+			apiVersion: groupVersion,
+			kind:       r.Kind,
+		})
+	}
+	return resources
+}
 
 func main() {
 	flag.Parse()
-	m, err := controllers.NewManager(controllers.GetConfigOrDie(), controllers.Options{})
+	cfg := controllers.GetConfigOrDie()
+	m, err := controllers.NewManager(cfg, controllers.Options{})
 	if err != nil {
 		glog.Fatal(err, "could not create manager")
 	}
-	kfs := kubefs.New(m.GetClient())
+	client := m.GetClient()
+	kfs := kubefs.New(client)
 	mp := filepath.Clean(*mountPath)
 	if err := os.MkdirAll(mp, os.ModeDir|0700); err != nil {
 		glog.Fatal(err, "could not create dir")
 	}
 
-	for _, t := range types {
-		if err := kfs.Register(m, t.apiVersion, t.kind); err != nil {
-			glog.Fatal(err, "could not register")
+	resources := getAllResources(cfg)
+	for _, r := range resources {
+		if err := kfs.Register(m, r.apiVersion, r.kind); err != nil {
+			glog.Errorf("%s/%s - could not register: %v", r.apiVersion, r.kind, err)
 		}
 	}
 
