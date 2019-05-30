@@ -72,8 +72,13 @@ func (fs *KubeFS) newNode(apiVersion, kind, namespace, name string) *refNode {
 
 func (fs *KubeFS) Register(m manager.Manager, apiVersion, kind string) error {
 	f := reconcile.Func(func(req reconcile.Request) (reconcile.Result, error) {
-		return fs.reconcile(apiVersion, kind, req)
+		r, err := fs.reconcile(apiVersion, kind, req)
+		if err != nil {
+			glog.Errorf("Error reconciling %v/%v/%v: %v", apiVersion, kind, req, err)
+		}
+		return r, err
 	})
+	glog.Infof("%v/%v", apiVersion, kind)
 	return controllers.NewControllerManagedBy(m).For(newObject(apiVersion, kind)).Complete(f)
 }
 
